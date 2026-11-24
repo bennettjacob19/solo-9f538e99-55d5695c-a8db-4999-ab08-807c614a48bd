@@ -11,9 +11,10 @@ Endpoints (HTML + JSON API):
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from .db import connect, init_db, recover_pending
-from .logic import (DrillError, ListChanged, abort_advance, allocate,
-                    change_pool, commit_advance, free_summary, get_state,
-                    prepare_advance, recent_logs)
+from .logic import (DrillError, ListChanged, abort_advance, active_lease_count,
+                    allocate, change_pool, commit_advance, free_summary,
+                    get_state, prepare_advance, recent_leases, recent_logs,
+                    _snapshot_overview)
 
 
 def create_app(db_path=None):
@@ -34,22 +35,31 @@ def create_app(db_path=None):
             pool_views = []
             for pool in state["pools"]:
                 summary = free_summary(conn, pool["id"])
-                active_count = conn.execute(
-                    "SELECT COUNT(*) AS c FROM leases"
-                    " WHERE pool_id = ? AND status = 'active'",
-                    (pool["id"],)).fetchone()["c"]
+                active_count = active_lease_count(
+                    conn, pool["id"], bool(pool["is_new"]))
                 pool_views.append({
                     "pool": pool, "summary": summary, "active_count": active_count,
                     "is_active": pool["id"] == (meta["new_pool_id"]
                                                 or state["pools"][0]["id"])})
-            leases = conn.execute(
-                "SELECT l.*, p.cidr AS pool_cidr FROM leases l"
-                " JOIN pools p ON p.id = l.pool_id"
-                " ORDER BY l.id DESC LIMIT 30").fetchall()
+            # Latest 30 individual leases; new-pool ones are derived from
+            # segment rows in memory rather than stored per lease.
+            leases = recent_leases(conn, limit=30)
             logs = recent_logs(conn)
+            pending_view = None
+            if pending:
+                legacy_ids, seg_entries = _snapshot_overview(
+                    conn, pending["id"])
+                pending_view = {
+                    "id": pending["id"],
+                    "target_seconds": pending["target_seconds"],
+                    "legacy_ids": legacy_ids,
+                    "segments": seg_entries,
+                    "segment_lease_total": sum(
+                        len(s["lease_ids"]) for s in seg_entries),
+                }
             return render_template(
                 "dashboard.html", meta=meta, pools=pool_views, leases=leases,
-                logs=logs, pending=pending)
+                logs=logs, pending=pending_view)
         finally:
             conn.close()
 

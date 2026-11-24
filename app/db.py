@@ -16,7 +16,10 @@ CREATE TABLE IF NOT EXISTS meta(
     id INTEGER PRIMARY KEY CHECK (id = 1),
     now_seconds INTEGER NOT NULL,
     new_pool_id INTEGER REFERENCES pools(id),
-    pending_id INTEGER REFERENCES clock_advance(id)
+    pending_id INTEGER REFERENCES clock_advance(id),
+    -- Global lease-id cursor for new-pool segment leases. NULL until the pool
+    -- swap; change_pool arms it above every existing legacy lease id.
+    lease_seq INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS pools(
@@ -73,7 +76,40 @@ CREATE TABLE IF NOT EXISTS withdrawal_publish(
     earliest_seconds INTEGER,
     published_at INTEGER NOT NULL
 );
+
+-- New-pool leases are stored as *contiguous slot segments*: one row covers
+-- [start_slot, end_slot) with consecutive lease ids derived as
+-- first_lease_id + (slot - start_slot). A batch allocation of thousands of
+-- adjacent prefixes therefore writes one row per contiguous run, never one
+-- row per lease. Expired segment rows are kept as history like leases.
+CREATE TABLE IF NOT EXISTS lease_segments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool_id INTEGER NOT NULL REFERENCES pools(id),
+    start_slot INTEGER NOT NULL,
+    end_slot INTEGER NOT NULL,
+    first_lease_id INTEGER NOT NULL,
+    starts_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'expired'))
+);
+CREATE INDEX IF NOT EXISTS ix_seg_pool_status
+    ON lease_segments(pool_id, status);
+
+-- Pause-time snapshot of the due set, stored as references: one row per
+-- legacy lease id or per new-pool segment id, so its size tracks the number
+-- of segments involved, not the number of individual leases.
+CREATE TABLE IF NOT EXISTS advance_snapshot(
+    advance_id INTEGER NOT NULL REFERENCES clock_advance(id),
+    kind TEXT NOT NULL CHECK (kind IN ('legacy', 'segment')),
+    ref_id INTEGER NOT NULL,
+    PRIMARY KEY (advance_id, kind, ref_id)
+);
 """
+
+# Additive migration for databases created before segment storage existed.
+SCHEMA_MIGRATIONS = (
+    "ALTER TABLE meta ADD COLUMN lease_seq INTEGER",
+)
 
 # Built-in old pool and its leases (simulated time, seconds since epoch).
 OLD_CIDR = "2001:db8:aaaa::/48"
@@ -116,6 +152,12 @@ def init_db(db_path=None, force=False):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        # Idempotent additive migrations for databases created by older code.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(meta)")}
+        for stmt in SCHEMA_MIGRATIONS:
+            col = stmt.split("ADD COLUMN")[1].strip().split()[0]
+            if col not in cols:
+                conn.execute(stmt)
         seeded = conn.execute("SELECT 1 FROM pools WHERE is_new = 0").fetchone()
         if seeded:
             return conn

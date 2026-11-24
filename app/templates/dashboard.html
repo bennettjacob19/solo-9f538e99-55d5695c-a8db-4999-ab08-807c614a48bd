@@ -36,9 +36,13 @@
   {% else %}<span class="tag old">未换池，仍使用内置旧池</span>{% endif %}
   {% if pending %}
     <p class="pending" style="padding:8px 10px;border-radius:6px;display:inline-block">
-      ⏸ 暂停待提交：推进 #{{ pending.id }} → t={{ pending.target_seconds }}s，
-      预计到期租约 [{{ pending.snapshot_ids }}]。期间可正常领址、网关可照常查撤路；
-      名单变化会退回并要求重做。
+      ⏸ 暂停待提交：推进 #{{ pending.id }} → t={{ pending.target_seconds }}s。
+      本次预计到期：旧池租约 {{ pending.legacy_ids|length }} 条
+      [{{ pending.legacy_ids|join(',') or '无' }}]；
+      新池连续段 {{ pending.segments|length }} 段，共
+      {{ pending.segment_lease_total }} 条租约
+      {% for s in pending.segments %}段{{ s.segment_id }}(槽[{{ s.slot_start }},{{ s.slot_end }})→租约id[{{ s.lease_id_start }},{{ s.lease_id_end }}]){% if not loop.last %}，{% endif %}{% else %}（无新池段）{% endfor %}。
+      期间可正常领址、网关可照常查撤路；名单变化会退回并要求重做。
       <form method="post" action="/api/advance/commit" style="display:inline">
         <button type="submit">提交推进</button></form>
       <form method="post" action="/api/advance/abort" style="display:inline">
